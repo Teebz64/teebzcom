@@ -1,11 +1,16 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
+import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer";
+import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass";
+import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass";
 import * as dat from "dat.gui";
 
 export class Scene {
   private scene: THREE.Scene;
   private camera: THREE.PerspectiveCamera;
   private renderer: THREE.WebGLRenderer;
+  private composer: EffectComposer;
+  private bloomPass: UnrealBloomPass;
   private controls: OrbitControls;
   private gui!: dat.GUI;
   private stripeMaterial: THREE.ShaderMaterial = new THREE.ShaderMaterial();
@@ -20,6 +25,10 @@ export class Scene {
     tubeRadius: number;
     radialSegments: number;
     tubularSegments: number;
+    stripeColor: string;
+    bloomStrength: number;
+    bloomRadius: number;
+    bloomThreshold: number;
   };
 
   constructor(container: HTMLDivElement) {
@@ -32,16 +41,11 @@ export class Scene {
       1000,
     );
     this.renderer = new THREE.WebGLRenderer({
-      antialias: false, // Disable anti-aliasing for a more pixelated look
+      antialias: true,
+      powerPreference: "high-performance",
     });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     container.appendChild(this.renderer.domElement);
-
-    // Setup controls
-    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
-    this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.05;
-    this.controls.enableZoom = true;
 
     // Initialize parameters
     this.params = {
@@ -52,7 +56,31 @@ export class Scene {
       tubeRadius: 3,
       radialSegments: 16,
       tubularSegments: 16,
+      stripeColor: "#ffffff",
+      bloomStrength: 1.5,
+      bloomRadius: 0.4,
+      bloomThreshold: 0.85,
     };
+
+    // Setup post-processing
+    this.composer = new EffectComposer(this.renderer);
+    const renderPass = new RenderPass(this.scene, this.camera);
+    this.composer.addPass(renderPass);
+
+    // Add bloom pass
+    this.bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      1.5,
+      0.4,
+      0.85,
+    );
+    this.composer.addPass(this.bloomPass);
+
+    // Setup controls
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.enableDamping = true;
+    this.controls.dampingFactor = 0.05;
+    this.controls.enableZoom = true;
 
     // Create GUI
     this.gui = new dat.GUI({
@@ -63,7 +91,6 @@ export class Scene {
     this.setupMaterial();
     this.setupMesh();
     this.setupGUI();
-    this.setupLights();
     this.setupScene();
     this.animate();
 
@@ -78,39 +105,49 @@ export class Scene {
         stripeWidth: { value: this.params.stripeWidth },
         stripeSpacing: { value: this.params.stripeSpacing },
         speed: { value: this.params.animationSpeed },
+        stripeColor: { value: new THREE.Color(this.params.stripeColor) },
       },
       vertexShader: `
-        varying vec4 vViewPosition;
+        varying vec3 vViewPosition;
+        varying float vDepth;
+
         void main() {
-            vec4 modelViewPosition = modelViewMatrix * vec4(position, 1.0);
-            vViewPosition = modelViewPosition;
-            gl_Position = projectionMatrix * modelViewPosition;
+            vec4 modelPosition = modelMatrix * vec4(position, 1.0);
+            vec4 viewPosition = viewMatrix * modelPosition;
+            vViewPosition = viewPosition.xyz;
+            
+            // Calculate normalized depth (0 = near, 1 = far)
+            vDepth = (-viewPosition.z - 20.0) / 20.0;
+            vDepth = clamp(vDepth, 0.0, 1.0);
+            
+            gl_Position = projectionMatrix * viewPosition;
         }
       `,
       fragmentShader: `
-        varying vec4 vViewPosition;
+        uniform vec3 stripeColor;
         uniform float stripeWidth;
         uniform float stripeSpacing;
         uniform float time;
         uniform float speed;
         
+        varying vec3 vViewPosition;
+        varying float vDepth;
+        
         void main() {
-            float animatedY = vViewPosition.y + time * speed;
+            // Use view space Y coordinate for consistent downward movement
+            float animatedY = -vViewPosition.y + time * speed;
             float totalWidth = stripeWidth + stripeSpacing;
             float stripePattern = mod(animatedY, totalWidth);
             float line = step(0.0, stripePattern) - step(stripeWidth, stripePattern);
             
-            vec3 lineColor = vec3(1.0);
-            vec3 finalColor = mix(vec3(0.0), lineColor, line);
-            float alpha = mix(0.95, 1.0, line);
-            
-            gl_FragColor = vec4(finalColor, alpha);
+            // Darken colors based on depth
+            float depthFactor = 1.0 - (vDepth * 0.98);
+            vec3 finalColor = mix(vec3(0.0), stripeColor * depthFactor, line);
+            gl_FragColor = vec4(finalColor, 1.0);
         }
       `,
-      transparent: true,
+      transparent: false,
       side: THREE.FrontSide,
-      depthWrite: true,
-      depthTest: true,
     });
   }
 
@@ -126,13 +163,13 @@ export class Scene {
     this.torus1 = new THREE.Mesh(geometry, this.stripeMaterial);
     this.torus2 = new THREE.Mesh(geometry.clone(), this.stripeMaterial);
 
-    // Position first torus slightly left of center (reduced from /2 to /3)
+    // Position first torus slightly left of center
     this.torus1.position.x = -this.params.torusRadius / 3;
 
     // Position and rotate second torus
     this.torus2.rotation.x = Math.PI / 1.8;
     this.torus2.rotation.z = Math.PI / 1.2;
-    this.torus2.position.x = this.params.torusRadius / 3; // reduced from /2 to /3
+    this.torus2.position.x = this.params.torusRadius / 3;
 
     // Clear any existing children from the group
     this.torusGroup.clear();
@@ -141,7 +178,7 @@ export class Scene {
     this.torusGroup.add(this.torus1);
     this.torusGroup.add(this.torus2);
 
-    // Rotate the entire group towards the user (around the X axis)
+    // Rotate the entire group towards the user
     this.torusGroup.rotation.x = THREE.MathUtils.degToRad(20);
 
     this.scene.add(this.torusGroup);
@@ -155,7 +192,6 @@ export class Scene {
       .onChange(() => {
         this.stripeMaterial.uniforms.stripeWidth.value =
           this.params.stripeWidth;
-        this.stripeMaterial.needsUpdate = true;
       });
     shaderFolder
       .add(this.params, "stripeSpacing", 0.1, 2.0, 0.1)
@@ -163,51 +199,45 @@ export class Scene {
       .onChange(() => {
         this.stripeMaterial.uniforms.stripeSpacing.value =
           this.params.stripeSpacing;
-        this.stripeMaterial.needsUpdate = true;
       });
     shaderFolder
       .add(this.params, "animationSpeed", 0.1, 2.0, 0.1)
       .onChange(() => {
         this.stripeMaterial.uniforms.speed.value = this.params.animationSpeed;
-        this.stripeMaterial.needsUpdate = true;
       });
     shaderFolder.open();
 
-    const geometryFolder = this.gui.addFolder("Torus Geometry");
+    const materialFolder = this.gui.addFolder("Material");
+    materialFolder
+      .addColor(this.params, "stripeColor")
+      .name("Stripe Color")
+      .onChange(() => {
+        this.stripeMaterial.uniforms.stripeColor.value.set(
+          this.params.stripeColor,
+        );
+      });
+    materialFolder.open();
 
-    const updateGeometry = () => {
-      const newGeometry = new THREE.TorusGeometry(
-        this.params.torusRadius,
-        this.params.tubeRadius,
-        this.params.radialSegments,
-        this.params.tubularSegments,
-      );
-
-      // Update both toruses
-      this.torus1.geometry.dispose();
-      this.torus2.geometry.dispose();
-      this.torus1.geometry = newGeometry;
-      this.torus2.geometry = newGeometry.clone();
-
-      // Maintain closer positioning
-      this.torus1.position.x = -this.params.torusRadius / 3;
-      this.torus2.position.x = this.params.torusRadius / 3;
-    };
-
-    geometryFolder
-      .add(this.params, "torusRadius", 5, 20, 0.5)
-      .onChange(updateGeometry);
-    geometryFolder
-      .add(this.params, "tubeRadius", 0.5, 6, 0.1)
-      .onChange(updateGeometry);
-    geometryFolder.open();
-  }
-
-  private setupLights(): void {
-    const pointLight = new THREE.PointLight(0xffffff);
-    pointLight.position.set(5, 5, 5);
-    const ambientLight = new THREE.AmbientLight(0xffffff);
-    this.scene.add(pointLight, ambientLight);
+    const bloomFolder = this.gui.addFolder("Bloom");
+    bloomFolder
+      .add(this.params, "bloomStrength", 0.0, 3.0, 0.05)
+      .name("Strength")
+      .onChange(() => {
+        this.bloomPass.strength = this.params.bloomStrength;
+      });
+    bloomFolder
+      .add(this.params, "bloomRadius", 0.0, 1.0, 0.01)
+      .name("Radius")
+      .onChange(() => {
+        this.bloomPass.radius = this.params.bloomRadius;
+      });
+    bloomFolder
+      .add(this.params, "bloomThreshold", 0.0, 1.0, 0.05)
+      .name("Threshold")
+      .onChange(() => {
+        this.bloomPass.threshold = this.params.bloomThreshold;
+      });
+    bloomFolder.open();
   }
 
   private setupScene(): void {
@@ -219,15 +249,15 @@ export class Scene {
     this.camera.aspect = window.innerWidth / window.innerHeight;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.composer.setSize(window.innerWidth, window.innerHeight);
   };
 
   private animate = (): void => {
     requestAnimationFrame(this.animate);
     this.controls.update();
     this.stripeMaterial.uniforms.time.value += 0.01;
-    // Example of rotating the entire group:
     this.torusGroup.rotation.x -= 0.001;
-    this.renderer.render(this.scene, this.camera);
+    this.composer.render();
   };
 
   public dispose(): void {
@@ -235,6 +265,7 @@ export class Scene {
     window.removeEventListener("resize", this.handleResize);
     this.controls.dispose();
     this.renderer.dispose();
+    this.composer.dispose();
     this.gui.destroy();
     this.torus1.geometry.dispose();
     this.torus2.geometry.dispose();
